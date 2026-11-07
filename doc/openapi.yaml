@@ -1,0 +1,731 @@
+openapi: 3.1.0
+info:
+  title: Jungle Gaming — Distributed Wagering Processor
+  version: 1.0.0
+  description: |
+    API para processamento de transações de apostas de múltiplos provedores de jogos.
+
+    ## Princípios
+
+    - **Idempotência:** toda operação de mutação aceita um header `Idempotency-Key`.
+      Reenvio com a mesma key e mesmo payload retorna o resultado original com
+      `idempotentReplay: true`. Mesma key com payload diferente retorna `409`.
+    - **Dinheiro:** sempre representado como `{ amount: string, currency: string }`.
+      `amount` é decimal string com exatamente 2 casas decimais. Nunca `number`.
+    - **Erros:** todo erro 4xx/5xx retorna o envelope `Error`. O campo `code` é
+      estável e legível por máquina — o provedor deve usar `code` (não `message`)
+      para tomar decisões de retry.
+    - **Ordem:** o sistema não garante ordem de processamento entre operações
+      independentes da mesma wallet. A única ordem garantida é a de referência
+      (`REFUND`/`ROLLBACK` depende da transação referenciada estar `PROCESSED`).
+
+    ## Mapeamento de status HTTP
+
+    | Código | Significado | Quando |
+    |--------|-------------|--------|
+    | 200 | OK | Leitura bem-sucedida; transação `PROCESSED` |
+    | 201 | Created | Wallet criada |
+    | 202 | Accepted | Transação aceita, aguardando referência (`PENDING_REFERENCE`) |
+    | 400 | Bad Request | Payload inválido (schema, Money, enum) |
+    | 404 | Not Found | Wallet, transação, ou provider não encontrado |
+    | 409 | Conflict | Wallet duplicada; idempotency key com payload divergente |
+    | 422 | Unprocessable Entity | Rejeição por regra de negócio (saldo insuficiente, referência inválida, etc.) |
+    | 503 | Service Unavailable | Falha transitória de infraestrutura (DB, SQS) |
+
+    **Nota sobre 422:** rejeições por regra de negócio retornam `422` com o
+    `failureCode` no body. A transação foi aceita e processada — o sistema
+    avaliou e decidiu rejeitar. O `failureCode` é o campo que o provedor usa
+    para decidir se reenvia, corrige o payload, ou desiste.
+
+servers:
+  - url: http://localhost:3000
+    description: Desenvolvimento local
+
+tags:
+  - name: Wallets
+    description: Criação e consulta de wallets
+  - name: Transactions
+    description: Submissão e consulta de transações de aposta
+  - name: Reconciliation
+    description: Reconciliação entre saldo materializado e ledger
+  - name: Health
+    description: Health checks (liveness e readiness)
+
+paths:
+  /wallets:
+    post:
+      tags: [Wallets]
+      operationId: createWallet
+      summary: Criar wallet
+      description: |
+        Cria uma nova wallet para um jogador. O saldo inicial, quando maior
+        que zero, gera uma transação interna `OPENING` com lançamento `CREDIT`
+        no ledger, na mesma transação SQL.
+
+        Se já existir uma wallet para o mesmo `playerId` + `currency`, retorna
+        `409 CONFLICT`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWalletRequest'
+      responses:
+        '201':
+          description: Wallet criada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '400':
+          description: Payload inválido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Wallet já existe para este playerId + currency
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Falha de infraestrutura
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wallets/{walletId}:
+    get:
+      tags: [Wallets]
+      operationId: getWallet
+      summary: Consultar wallet
+      parameters:
+        - $ref: '#/components/parameters/WalletId'
+      responses:
+        '200':
+          description: Wallet encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '404':
+          description: Wallet não encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Falha de infraestrutura
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wallets/{walletId}/ledger:
+    get:
+      tags: [Wallets]
+      operationId: getWalletLedger
+      summary: Consultar ledger da wallet
+      description: |
+        Retorna os lançamentos do ledger da wallet, paginados por cursor.
+        O cursor é opaco e estável — não deve ser interpretado pelo cliente.
+        A paginação é em ordem cronológica (mais antigos primeiro).
+      parameters:
+        - $ref: '#/components/parameters/WalletId'
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Cursor de paginação (opaco). Omitir para a primeira página.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: Máximo de lançamentos por página (default 50, max 100).
+      responses:
+        '200':
+          description: Ledger da wallet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerPage'
+        '404':
+          description: Wallet não encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Falha de infraestrutura
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wallets/{walletId}/reconciliation:
+    post:
+      tags: [Reconciliation]
+      operationId: reconcileWallet
+      summary: Reconciliar saldo materializado com ledger
+      description: |
+        Recalcula o saldo a partir dos lançamentos do ledger e compara com o
+        saldo materializado. Divergências **não** são corrigidas silenciosamente
+        — são logadas, contabilizadas em métrica e sinalizadas na resposta.
+      parameters:
+        - $ref: '#/components/parameters/WalletId'
+      responses:
+        '200':
+          description: Resultado da reconciliação
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationResult'
+        '404':
+          description: Wallet não encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Falha de infraestrutura
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wagering/transactions:
+    post:
+      tags: [Transactions]
+      operationId: submitTransaction
+      summary: Submeter transação de aposta
+      description: |
+        Submete uma transação de aposta para processamento. O processamento é
+        **síncrono**: a resposta contém o resultado final (`PROCESSED`,
+        `REJECTED`, ou `PENDING_REFERENCE`).
+
+        **Idempotência:** o header `Idempotency-Key` é obrigatório. O default
+        recomendado é `"{providerId}:{externalTransactionId}"`.
+
+        - Requisição idêntica (mesma key, mesmo payload) → mesma resposta,
+          `idempotentReplay: true`.
+        - Mesma key com payload diferente → `409 IDEMPOTENCY_CONFLICT`.
+
+        **Status na resposta:**
+        - `200` + `status: PROCESSED` — transação aplicada, saldo atualizado.
+        - `422` + `status: REJECTED` — transação rejeitada por regra de negócio.
+          O campo `failureCode` indica o motivo.
+        - `202` + `status: PENDING_REFERENCE` — transação aceita, aguardando a
+          transação referenciada (`REFUND`/`ROLLBACK` cuja referência ainda não
+          está `PROCESSED`).
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: |
+            Chave de idempotência. Default recomendado:
+            `"{providerId}:{externalTransactionId}"`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitTransactionRequest'
+      responses:
+        '200':
+          description: Transação processada (PROCESSED)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitTransactionResponse'
+        '202':
+          description: Transação aceita, aguardando referência
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitTransactionResponse'
+        '400':
+          description: Payload inválido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Wallet não encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Conflito de idempotência (mesma key, payload diferente)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Rejeição por regra de negócio (saldo insuficiente, referência inválida, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitTransactionResponse'
+        '503':
+          description: Falha transitória de infraestrutura
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wagering/transactions/{transactionId}:
+    get:
+      tags: [Transactions]
+      operationId: getTransaction
+      summary: Consultar transação por ID interno
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Transação encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WagerTransaction'
+        '404':
+          description: Transação não encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Falha de infraestrutura
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /providers/{providerId}/wagering/transactions/{externalTransactionId}:
+    get:
+      tags: [Transactions]
+      operationId: getTransactionByProvider
+      summary: Consultar transação por provider + ID externo
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: externalTransactionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Transação encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WagerTransaction'
+        '404':
+          description: Transação não encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Falha de infraestrutura
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: liveness
+      summary: Liveness probe
+      description: Retorna 200 se o processo está vivo. Não verifica dependências.
+      responses:
+        '200':
+          description: Processo vivo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: alive
+        '503':
+          description: Processo não responsivo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: readiness
+      summary: Readiness probe
+      description: |
+        Retorna 200 se o processo está vivo **e** as dependências
+        (PostgreSQL e SQS) estão alcançáveis.
+      responses:
+        '200':
+          description: Pronto para receber tráfego
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+                  dependencies:
+                    type: object
+                    properties:
+                      postgres:
+                        type: string
+                        enum: [ok, error]
+                      sqs:
+                        type: string
+                        enum: [ok, error]
+        '503':
+          description: Dependência indisponível
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  parameters:
+    WalletId:
+      name: walletId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    # ─── Money ───────────────────────────────────────────────────────────
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{2}$'
+          description: Decimal string com exatamente 2 casas decimais. Ex.: "25.00"
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          description: Código ISO-4217. Ex.: "BRL"
+      example:
+        amount: "25.00"
+        currency: "BRL"
+
+    # ─── Wallet ──────────────────────────────────────────────────────────
+
+    CreateWalletRequest:
+      type: object
+      required: [playerId, initialBalance]
+      properties:
+        playerId:
+          type: string
+          format: uuid
+          description: ID único do jogador.
+        initialBalance:
+          $ref: '#/components/schemas/Money'
+          description: Saldo inicial. "0.00" para wallet vazia.
+
+    Wallet:
+      type: object
+      required: [id, playerId, balance, version, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        playerId:
+          type: string
+          format: uuid
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+        balance:
+          $ref: '#/components/schemas/Money'
+        version:
+          type: integer
+          minimum: 1
+          description: Incrementa a cada mudança de saldo.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ─── Ledger ──────────────────────────────────────────────────────────
+
+    LedgerDirection:
+      type: string
+      enum: [DEBIT, CREDIT]
+
+    LedgerEntry:
+      type: object
+      required: [id, walletId, transactionId, direction, money, balanceBefore, balanceAfter, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        walletId:
+          type: string
+          format: uuid
+        transactionId:
+          type: string
+          format: uuid
+        direction:
+          $ref: '#/components/schemas/LedgerDirection'
+        money:
+          $ref: '#/components/schemas/Money'
+        balanceBefore:
+          $ref: '#/components/schemas/Money'
+        balanceAfter:
+          $ref: '#/components/schemas/Money'
+        createdAt:
+          type: string
+          format: date-time
+
+    LedgerPage:
+      type: object
+      required: [entries, nextCursor]
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/LedgerEntry'
+        nextCursor:
+          type: string
+          nullable: true
+          description: Cursor para a próxima página. `null` se não houver mais páginas.
+
+    # ─── WagerTransaction ────────────────────────────────────────────────
+
+    WagerTransactionKind:
+      type: string
+      enum: [OPENING, BET, WIN, LOSS, REFUND, ROLLBACK]
+
+    WagerTransactionStatus:
+      type: string
+      enum: [PENDING, PENDING_REFERENCE, PROCESSED, REJECTED, FAILED]
+
+    FailureCode:
+      type: string
+      description: |
+        Código estável e legível por máquina que identifica o motivo da
+        rejeição. O provedor deve usar este campo (não a `message`) para
+        decidir se reenvia, corrige o payload, ou desiste.
+      enum:
+        - INSUFFICIENT_BALANCE
+        - REVERSAL_WOULD_NEGATE_BALANCE
+        - REFERENCE_NOT_FOUND
+        - REFERENCE_NOT_PROCESSED
+        - ALREADY_REVERSED
+        - CURRENCY_MISMATCH
+        - WALLET_NOT_FOUND
+        - PLAYER_WALLET_MISMATCH
+        - INVALID_MONEY
+        - IDEMPOTENCY_CONFLICT
+        - OPENING_NOT_ALLOWED
+        - INFRASTRUCTURE_ERROR
+
+    WagerTransaction:
+      type: object
+      required: [id, providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: ID interno da transação.
+        providerId:
+          type: string
+        externalTransactionId:
+          type: string
+          description: ID da transação no provedor.
+        idempotencyKey:
+          type: string
+        playerId:
+          type: string
+          format: uuid
+        walletId:
+          type: string
+          format: uuid
+        roundId:
+          type: string
+        gameId:
+          type: string
+        kind:
+          $ref: '#/components/schemas/WagerTransactionKind'
+        money:
+          $ref: '#/components/schemas/Money'
+        referenceExternalTransactionId:
+          type: string
+          nullable: true
+          description: ID externo da transação referenciada (para REFUND/ROLLBACK).
+        status:
+          $ref: '#/components/schemas/WagerTransactionStatus'
+        failureCode:
+          $ref: '#/components/schemas/FailureCode'
+          nullable: true
+          description: Presente apenas quando status é REJECTED ou FAILED.
+        processedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    # ─── Submit Transaction ──────────────────────────────────────────────
+
+    SubmitTransactionRequest:
+      type: object
+      required: [providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money]
+      properties:
+        providerId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        externalTransactionId:
+          type: string
+          minLength: 1
+          maxLength: 256
+        playerId:
+          type: string
+          format: uuid
+        walletId:
+          type: string
+          format: uuid
+        roundId:
+          type: string
+          minLength: 1
+          maxLength: 256
+        gameId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        kind:
+          $ref: '#/components/schemas/WagerTransactionKind'
+          description: |
+            Tipo da transação. `OPENING` não pode ser submetido pela API —
+            é gerado internamente na criação da wallet.
+        money:
+          $ref: '#/components/schemas/Money'
+        referenceExternalTransactionId:
+          type: string
+          nullable: true
+          description: |
+            Obrigatório para `REFUND` e `ROLLBACK`. ID externo da transação
+            referenciada (mesmo provider). Opcional para `WIN` (pode referenciar
+            a `BET` da mesma rodada).
+
+    SubmitTransactionResponse:
+      type: object
+      required: [transactionId, status, idempotentReplay]
+      properties:
+        transactionId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/WagerTransactionStatus'
+        balance:
+          $ref: '#/components/schemas/Money'
+          nullable: true
+          description: Saldo da wallet após o processamento. Presente quando o saldo mudou.
+        failureCode:
+          $ref: '#/components/schemas/FailureCode'
+          nullable: true
+          description: Presente quando status é REJECTED.
+        idempotentReplay:
+          type: boolean
+          description: `true` se esta é uma resposta de replay (mesma idempotency key, mesmo payload).
+
+    # ─── Reconciliation ──────────────────────────────────────────────────
+
+    ReconciliationResult:
+      type: object
+      required: [walletId, storedBalance, calculatedBalance, difference, consistent, checkedEntries]
+      properties:
+        walletId:
+          type: string
+          format: uuid
+        storedBalance:
+          $ref: '#/components/schemas/Money'
+          description: Saldo materializado na tabela `wallets`.
+        calculatedBalance:
+          $ref: '#/components/schemas/Money'
+          description: Saldo reconstruído a partir dos lançamentos do ledger.
+        difference:
+          $ref: '#/components/schemas/Money'
+          description: `storedBalance - calculatedBalance`. "0.00" se consistente.
+        consistent:
+          type: boolean
+        checkedEntries:
+          type: integer
+          minimum: 0
+          description: Número de lançamentos do ledger verificados.
+
+    # ─── Error ───────────────────────────────────────────────────────────
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Código de erro estável. Para erros de validação: `VALIDATION_ERROR`.
+            Para conflitos: `CONFLICT`, `IDEMPOTENCY_CONFLICT`.
+            Para rejeições de negócio: o `FailureCode` correspondente.
+            Para infraestrutura: `INFRASTRUCTURE_ERROR`.
+          enum:
+            - VALIDATION_ERROR
+            - CONFLICT
+            - IDEMPOTENCY_CONFLICT
+            - INSUFFICIENT_BALANCE
+            - REVERSAL_WOULD_NEGATE_BALANCE
+            - REFERENCE_NOT_FOUND
+            - REFERENCE_NOT_PROCESSED
+            - ALREADY_REVERSED
+            - CURRENCY_MISMATCH
+            - WALLET_NOT_FOUND
+            - PLAYER_WALLET_MISMATCH
+            - INVALID_MONEY
+            - OPENING_NOT_ALLOWED
+            - INFRASTRUCTURE_ERROR
+        message:
+          type: string
+          description: Mensagem legível por humanos. Não deve ser usada para lógica de retry.
+        details:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Detalhes adicionais (ex.: campos inválidos em VALIDATION_ERROR).

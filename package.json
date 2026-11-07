@@ -1,0 +1,37 @@
+{
+  "name": "jungle-gaming-backend",
+  "version": "1.0.0",
+  "description": "Distributed Wagering Processor — zero-trust back-end para cassino virtual",
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "dev": "bun --watch src/main.ts",
+    "test": "bun test",
+    "test:unit": "bun test test/unit",
+    "test:integration": "bun test test/integration",
+    "test:concurrency": "bun test test/concurrency",
+    "test:load": "bun test test/load",
+    "build": "bun build src/main.ts --outdir dist --target bun --packages external"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1163.0",
+    "@mikro-orm/core": "7.2.7",
+    "@mikro-orm/decorators": "7.2.7",
+    "@mikro-orm/nestjs": "^7.0.0",
+    "@mikro-orm/postgresql": "7.2.7",
+    "@mikro-orm/reflection": "7.2.7",
+    "@nestjs/common": "^12.4.0",
+    "@nestjs/core": "^12.4.0",
+    "@nestjs/platform-express": "^12.4.0",
+    "mikro-orm": "7.2.7",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "uuid": "^14.0.3",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "@types/express": "^5.0.6",
+    "typescript": "^7.0.2"
+  }
+}
